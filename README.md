@@ -2,7 +2,11 @@
 
 Origin: A simple & scalable pub/sub service with Last Value Caching, written in Node.js using ZMQ and Redis. Comes with iOS client library.
 
+This is the Objective-C client library, used for connecting to the Origin service, so you can subscribe on channels and consume updates in your iOS & Mac OS X apps.
+
+[Node.js Service Interface](https://github.com/lmirosevic/Origin-service-interface)
 [Node.js Service](https://github.com/lmirosevic/Origin-service)
+[Objective-C Client](https://github.com/lmirosevic/Origin-client)
 
 Copyright & License
 ------------
