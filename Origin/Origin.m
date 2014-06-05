@@ -11,7 +11,7 @@
 
 #import "Origin.h"
 
-#import <MsgPackSerialization/MsgPackSerialization.h>
+#import <MessagePack/MessagePack.h>
 #import "zmq.h"
 
 static BOOL const kDefaultShouldRunProcessorBlockOnBackgroundThread =   NO;
@@ -40,9 +40,8 @@ typedef enum {
 
 +(instancetype)packetWithData:(NSData *)data {
     //convert to json using msgpack
-    NSError *error;
-    NSDictionary *dictionary = [MsgPackSerialization MsgPackObjectWithData:data options:0 error:&error];
-    if (error) @throw [NSException exceptionWithName:NSInternalInconsistencyException reason:[NSString stringWithFormat:@"MsgPack deserialization failed with error: %@", error] userInfo:@{@"error": error}];
+    NSDictionary *dictionary = [MessagePackParser parseData:data];
+    if (!dictionary) @throw [NSException exceptionWithName:NSInternalInconsistencyException reason:@"MsgPack deserialization failed" userInfo:nil];
     
     //convert nsdictionary to object
     NSString *typeString = dictionary[@"type"];
@@ -123,10 +122,9 @@ typedef enum {
     
     dictionary = @{@"foo": @"bar"};
     
-    //convert to data from dictionary with msgpack
-    NSError *error;
-    NSData *data = [MsgPackSerialization dataWithMsgPackObject:dictionary options:0 error:&error];
-    if (error) @throw [NSException exceptionWithName:NSInternalInconsistencyException reason:[NSString stringWithFormat:@"MsgPack serialization failed with error: %@", error] userInfo:@{@"error": error}];
+    // convert to data from dictionary with msgpack
+    NSData *data = [MessagePackPacker pack:dictionary];
+    if (!data) @throw [NSException exceptionWithName:NSInternalInconsistencyException reason:@"MsgPack serialization failed" userInfo:nil];
     
     return data;
 }
@@ -496,7 +494,7 @@ typedef enum {
 -(void)_sendPacketToServer:(OriginPacket *)packet {
     // serialize it
     NSData *serializedPacket = [packet dataRepresentation];
-    
+    NSLog(@"%@", serializedPacket);
     // send it off
     [self _sendDataToInprocSocket:serializedPacket];
 }
@@ -531,15 +529,14 @@ typedef enum {
     // Connect the DEALER socket to the server
     self.dealerSocketBackground = zmq_socket(self.context, ZMQ_DEALER);
     int rc = zmq_connect(self.dealerSocketBackground, [[NSString stringWithFormat:@"tcp://%@:%ld", server, port] UTF8String]);
-    assert (rc == 0);
+    assert(rc == 0);
 }
 
 -(void)_bindPairSocketToInprocEndpoint:(NSString *)inprocEndpoint {
     // Bind the inproc PAIR socket on the known endpoint, so we can message it from other threads
     self.pairSocketBackground = zmq_socket(self.context, ZMQ_PAIR);
     int rc = zmq_bind(self.pairSocketBackground, [[NSString stringWithFormat:@"inproc://%@", inprocEndpoint] UTF8String]);
-    printf ("Error occurred: %s\n", zmq_strerror (errno));
-    assert (rc == 0);
+    assert(rc == 0);
 }
 
 -(void)_startMessageListenerLoop {
@@ -556,6 +553,8 @@ typedef enum {
         if (items[0].revents & ZMQ_POLLIN) {
             int err;
             
+            NSLog(@"got sth from the PAIR socket");
+            
             // Read the message from the PAIR socket
             zmq_msg_t incomingMessage;
             err = zmq_msg_init(&incomingMessage);
@@ -563,7 +562,7 @@ typedef enum {
                 NSLog(@"something whent wrong creating msg");
             };
             
-            err = zmq_recvmsg(self.dealerSocketBackground, &incomingMessage, 0);
+            err = zmq_recvmsg(self.pairSocketBackground, &incomingMessage, 0);
             if (err == -1) {
                 NSLog(@"something whent wrong receiving");
                 
@@ -616,21 +615,21 @@ typedef enum {
 }
 
 -(void)_sendDataToInprocSocket:(NSData *)data {
-	zmq_msg_t msg;
-	int err = zmq_msg_init_size(&msg, [data length]);
+	zmq_msg_t message;
+	int err = zmq_msg_init_size(&message, [data length]);
 	if (err) {
         NSLog(@"could not make msg");
 	}
     
-	[data getBytes:zmq_msg_data(&msg) length:zmq_msg_size(&msg)];
+	[data getBytes:zmq_msg_data(&message) length:zmq_msg_size(&message)];
 
-	err = zmq_sendmsg(self.pairSocketMain, &msg, 0);
+	err = zmq_sendmsg(self.pairSocketMain, &message, 0);
 	BOOL didSendData = (-1 != err);
 	if (!didSendData) {
         NSLog(@"could not send data");
 	}
     
-	err = zmq_msg_close(&msg);
+	err = zmq_msg_close(&message);
 	if (err) {
         NSLog(@"could not close msg");
 	}
