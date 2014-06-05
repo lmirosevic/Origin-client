@@ -11,8 +11,13 @@
 
 #import "Origin.h"
 
+#import <MsgPackSerialization/MsgPackSerialization.h>
+#import "zmq.h"
+
 static BOOL const kDefaultShouldRunProcessorBlockOnBackgroundThread =   NO;
 static NSTimeInterval const kHeartbeatInterval =                        5;// seconds
+
+static NSString * const kInprocEndpointName =                           @"internalProxy";// used for sending messages between threads
 
 typedef enum {
     PacketTypeUnknown,
@@ -116,6 +121,8 @@ typedef enum {
         @"payload": self.model ?: @{},// if there's no model then make it an empty dictionary as a failsafe
     };
     
+    dictionary = @{@"foo": @"bar"};
+    
     //convert to data from dictionary with msgpack
     NSError *error;
     NSData *data = [MsgPackSerialization dataWithMsgPackObject:dictionary options:0 error:&error];
@@ -137,6 +144,19 @@ typedef enum {
 @property (strong, nonatomic) dispatch_queue_t                          processorQueue;
 @property (strong, nonatomic) NSMutableDictionary                       *cache;
 @property (strong, nonatomic) NSTimer                                   *heartbeatTimer;
+
+@property (assign, nonatomic, readwrite) BOOL                           isConnected;
+
+@property (copy, atomic) NSString                                       *server;
+@property (assign, atomic) NSUInteger                                   port;
+
+@property (strong, atomic) NSThread                                     *backgroundThread;
+
+@property (assign, nonatomic) void                                      *context;
+@property (assign, nonatomic) void                                      *dealerSocketBackground;
+@property (assign, nonatomic) void                                      *pairSocketMain;
+@property (assign, nonatomic) void                                      *pairSocketBackground;
+
 
 @end
 
@@ -176,11 +196,31 @@ typedef enum {
 #pragma mark - API
 
 -(void)connectToServer:(NSString *)server port:(NSUInteger)port {
-    if (!server || !([server isKindOfClass:NSString.class] && server.length > 0)) @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"Server must be a non-empty string." userInfo:nil];
-    if (!(port >= 1 || port <= 65535)) @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"Post must be a valid port between 1 and 65535." userInfo:nil];
-    
-    [self _connectToServer:server port:port];
-    [self _startHeartbeatTimer];
+    if (!self.isConnected) {
+        if (!server || !([server isKindOfClass:NSString.class] && server.length > 0)) @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"Server must be a non-empty string." userInfo:nil];
+        if (!(port >= 1 || port <= 65535)) @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"Post must be a valid port between 1 and 65535." userInfo:nil];
+        
+        // remember that we are connected to that we don't run this method more than once.
+        self.isConnected = YES;
+        
+        // store our settings
+        self.server = server;
+        self.port = port;
+        
+        // set up the stuff on the main thread
+        [self _createZMQContext];
+        [self _setupForegroundGateway];
+        
+        // set up the background stuff
+        self.backgroundThread = [[NSThread alloc] initWithTarget:self selector:@selector(_setupBackgroundMachine) object:nil];
+        [self.backgroundThread start];
+        
+        // start the heartbeat stuff
+        [self _startHeartbeatTimer];
+    }
+    else {
+        NSLog(@"Origin is already connected. Skipping operation...");
+    }
 }
 
 -(void)subscribeToChannel:(NSString *)channel {
@@ -406,15 +446,8 @@ typedef enum {
 
 #pragma mark - Util:Networking
 
--(void)_connectToServer:(NSString *)server port:(NSUInteger)port {
-    //lm TODO
-}
-
--(void)_disconnectFromServer {
-    //lm TODO
-}
-
 -(void)_sendHeartbeatToServer {
+    NSLog(@"Sending heatbeat to server");
     OriginPacket *heartbeat = [[OriginPacket alloc] initWithType:PacketTypeHeartbeat model:nil];
     
     [self _sendPacketToServer:heartbeat];
@@ -465,13 +498,183 @@ typedef enum {
     NSData *serializedPacket = [packet dataRepresentation];
     
     // send it off
-    //lm todo
+    [self _sendDataToInprocSocket:serializedPacket];
 }
 
--(void)_receiveDataFromServer:(NSData *)data {
+-(void)_receivedDataFromServer:(NSData *)data {
     OriginPacket *packet = [OriginPacket packetWithData:data];
     
+    NSLog(@"got a packet from the server");
+    NSLog(@"%@", packet);//lm ill
+    
     [self _processReceivedPacket:packet];
+}
+
+#pragma mark - Util:ZMQ
+
+-(void)_setupForegroundGateway {
+    [self _connectMainPairSocketToBackgroundPairSocketOnInprocEndpoint:kInprocEndpointName];
+}
+
+-(void)_setupBackgroundMachine {
+    @autoreleasepool {
+        // Setup
+        [self _connectDealerSocketToServer:self.server port:self.port];
+        [self _bindPairSocketToInprocEndpoint:kInprocEndpointName];
+
+        // Start our loop
+        [self _startMessageListenerLoop];
+    }
+}
+
+-(void)_connectDealerSocketToServer:(NSString *)server port:(NSUInteger)port {
+    // Connect the DEALER socket to the server
+    self.dealerSocketBackground = zmq_socket(self.context, ZMQ_DEALER);
+    int rc = zmq_connect(self.dealerSocketBackground, [[NSString stringWithFormat:@"tcp://%@:%ld", server, port] UTF8String]);
+    assert (rc == 0);
+}
+
+-(void)_bindPairSocketToInprocEndpoint:(NSString *)inprocEndpoint {
+    // Bind the inproc PAIR socket on the known endpoint, so we can message it from other threads
+    self.pairSocketBackground = zmq_socket(self.context, ZMQ_PAIR);
+    int rc = zmq_bind(self.pairSocketBackground, [[NSString stringWithFormat:@"inproc://%@", inprocEndpoint] UTF8String]);
+    printf ("Error occurred: %s\n", zmq_strerror (errno));
+    assert (rc == 0);
+}
+
+-(void)_startMessageListenerLoop {
+    //  Process messages from both sockets
+    while (true) {
+        zmq_pollitem_t items [] = {
+            { self.pairSocketBackground,   0, ZMQ_POLLIN, 0 },
+            { self.dealerSocketBackground, 0, ZMQ_POLLIN, 0 }
+        };
+        zmq_poll(items, 2, -1);
+        
+        
+        // Incoming message from main thread on the PAIR socket
+        if (items[0].revents & ZMQ_POLLIN) {
+            int err;
+            
+            // Read the message from the PAIR socket
+            zmq_msg_t incomingMessage;
+            err = zmq_msg_init(&incomingMessage);
+            if (err) {
+                NSLog(@"something whent wrong creating msg");
+            };
+            
+            err = zmq_recvmsg(self.dealerSocketBackground, &incomingMessage, 0);
+            if (err == -1) {
+                NSLog(@"something whent wrong receiving");
+                
+                err = zmq_msg_close(&incomingMessage);
+                if (err) {
+                    NSLog(@"something went wrong closing the message");
+                }
+                
+                // if the context got destroyed, clean ourselves up
+                if (errno == ETERM) {
+                    NSLog(@"going down, close background thread");
+                    break;// break out of the while loop, so we can reach the socket closing code
+                }
+            }
+
+            
+            // Send the raw message on the DEALER socket
+            err = zmq_sendmsg(self.dealerSocketBackground, &incomingMessage, 0);
+            if (err == -1) {
+                NSLog(@"something went wrong passing message on to dealer");
+            }
+            
+            // Close the message
+            err = zmq_msg_close(&incomingMessage);
+            if (err) {
+                NSLog(@"could not close the msg");
+            }
+        }
+        
+        // Incoming messages from the server on the DEALER socket
+        if (items [1].revents & ZMQ_POLLIN) {
+            
+            NSData *incomingData = [self _readDataFromZMQSocket:self.dealerSocketBackground];
+            NSLog(@"+++++++got the data in, should now send it using GCD to the main thread");
+            
+            [self performSelectorOnMainThread:@selector(_receivedDataFromServer:) withObject:incomingData waitUntilDone:NO];
+        }
+    }
+    
+    NSLog(@"closing BG sockets");
+    // close the BG sockets
+    zmq_close(self.dealerSocketBackground);
+    zmq_close(self.pairSocketBackground);
+}
+
+-(void)_connectMainPairSocketToBackgroundPairSocketOnInprocEndpoint:(NSString *)inprocEndpoint {
+    self.pairSocketMain = zmq_socket(self.context, ZMQ_PAIR);
+    int rc = zmq_connect(self.pairSocketMain, [[NSString stringWithFormat:@"inproc://%@", inprocEndpoint] UTF8String]);
+    assert (rc == 0);
+}
+
+-(void)_sendDataToInprocSocket:(NSData *)data {
+	zmq_msg_t msg;
+	int err = zmq_msg_init_size(&msg, [data length]);
+	if (err) {
+        NSLog(@"could not make msg");
+	}
+    
+	[data getBytes:zmq_msg_data(&msg) length:zmq_msg_size(&msg)];
+
+	err = zmq_sendmsg(self.pairSocketMain, &msg, 0);
+	BOOL didSendData = (-1 != err);
+	if (!didSendData) {
+        NSLog(@"could not send data");
+	}
+    
+	err = zmq_msg_close(&msg);
+	if (err) {
+        NSLog(@"could not close msg");
+	}
+}
+
+-(NSData *)_readDataFromZMQSocket:(void *)socket {
+    zmq_msg_t msg;
+    int err = zmq_msg_init(&msg);
+    if (err) {
+        NSLog(@"some error occured creatong the zmq message");
+    }
+    
+    err = zmq_recvmsg(socket, &msg, 0);
+    if (err == -1) {
+        NSLog(@"something whent wrong receiving");
+        
+        err = zmq_msg_close(&msg);
+        if (err) {
+            NSLog(@"something went wrong closing the message");
+        }
+    }
+    
+    
+    size_t length = zmq_msg_size(&msg);
+    NSData *data = [NSData dataWithBytes:zmq_msg_data(&msg) length:length];
+    
+    err = zmq_msg_close(&msg);
+    if (err) {
+        NSLog(@"could not close the msg");
+    }
+    
+    return data;
+}
+
+-(void)_createZMQContext {
+    self.context = zmq_ctx_new();
+}
+
+-(void)_disconnectFromServer {
+    // Close the main socket
+    zmq_close(self.pairSocketMain);
+
+    // Destroy the context, which will trigger ETERM on the background thread triggering it clean up
+    zmq_ctx_destroy(self.context);
 }
 
 @end

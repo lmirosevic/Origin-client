@@ -99,4 +99,9 @@ typedef id(^OriginDeserializerBlock)(id message);
  */
 @property (assign, nonatomic) BOOL shouldRunProcessorBlockOnBackgroundThread;
 
+/**
+ Returns YES if you have previously called -[connectToServer:port:]
+ */
+@property (assign, nonatomic, readonly) BOOL isConnected;
+
 @end
