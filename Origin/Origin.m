@@ -32,7 +32,7 @@ typedef enum {
 @interface OriginPacket : NSObject
 
 @property (assign, nonatomic) PacketType                                type;
-@property (strong, nonatomic) id                                        model;
+@property (strong, nonatomic) id                                        payload;
 
 @end
 
@@ -45,7 +45,7 @@ typedef enum {
     
     //convert nsdictionary to object
     NSString *typeString = dictionary[@"type"];
-    id model = dictionary[@"payload"];
+    id payload = dictionary[@"payload"];
     
     PacketType type;
     if ([typeString isEqualToString:@"subscription"]) {
@@ -70,13 +70,13 @@ typedef enum {
         type = PacketTypeUnknown;
     }
     
-    return [[self alloc] initWithType:type model:model];
+    return [[self alloc] initWithType:type payload:payload];
 }
 
--(id)initWithType:(PacketType)type model:(id)model {
+-(id)initWithType:(PacketType)type payload:(id)payload {
     if (self = [self init]) {
         self.type = type;
-        self.model = model;
+        self.payload = payload;
     }
     
     return self;
@@ -117,7 +117,7 @@ typedef enum {
     
     NSDictionary *dictionary = @{
         @"type": typeString,
-        @"payload": self.model ?: @{},// if there's no model then make it an empty dictionary as a failsafe
+        @"payload": self.payload ?: @{},// if there's no payload then make it an empty dictionary as a failsafe
     };
     
     dictionary = @{@"foo": @"bar"};
@@ -133,7 +133,7 @@ typedef enum {
 
 @interface Origin ()
 
-@property (copy, nonatomic) OriginDeserializerBlock                     defaultDeserializer;
+@property (copy, nonatomic) OriginDeserializerBlock                     myDefaultDeserializer;
 @property (strong, nonatomic) NSMutableDictionary                       *channelDeserializers;
 @property (strong, nonatomic) NSMutableDictionary                       *channelUpdateBlocks;
 @property (strong, nonatomic) NSMutableDictionary                       *channelSubscriptionBlocks;
@@ -328,11 +328,11 @@ typedef enum {
 -(void)setDefaultDeserializer:(OriginDeserializerBlock)deserializerBlock {
     if (!deserializerBlock) @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"Deserializer block must not be nil." userInfo:nil];
     
-    self.defaultDeserializer = deserializerBlock;// block gets copied onto heap automaticaly by setter
+    self.myDefaultDeserializer = deserializerBlock;// block gets copied onto heap automaticaly by setter
 }
 
 -(void)removeDefaultDeserializer {
-    self.defaultDeserializer = nil;
+    self.myDefaultDeserializer = nil;
 }
 
 #pragma mark - Util
@@ -379,8 +379,8 @@ typedef enum {
     if (self.channelDeserializers[channel]) {
         processor = self.channelDeserializers[channel];
     }
-    else if (self.defaultDeserializer) {
-        processor = self.defaultDeserializer;
+    else if (self.myDefaultDeserializer) {
+        processor = self.myDefaultDeserializer;
     }
     
     if (!processor) {
@@ -446,19 +446,19 @@ typedef enum {
 
 -(void)_sendHeartbeatToServer {
     NSLog(@"Sending heatbeat to server");
-    OriginPacket *heartbeat = [[OriginPacket alloc] initWithType:PacketTypeHeartbeat model:nil];
+    OriginPacket *heartbeat = [[OriginPacket alloc] initWithType:PacketTypeHeartbeat payload:nil];
     
     [self _sendPacketToServer:heartbeat];
 }
 
 -(void)_sendSubscriptionRequestForChannel:(NSString *)channel {
-    OriginPacket *subscription = [[OriginPacket alloc] initWithType:PacketTypeSubscription model:@{@"channel": channel}];
+    OriginPacket *subscription = [[OriginPacket alloc] initWithType:PacketTypeSubscription payload:@{@"channel": channel}];
 
     [self _sendPacketToServer:subscription];
 }
 
 -(void)_sendUnsubscriptionRequestForChannel:(NSString *)channel {
-    OriginPacket *unsubscription = [[OriginPacket alloc] initWithType:PacketTypeUnsubscription model:@{@"channel": channel}];
+    OriginPacket *unsubscription = [[OriginPacket alloc] initWithType:PacketTypeUnsubscription payload:@{@"channel": channel}];
 
     [self _sendPacketToServer:unsubscription];
 }
@@ -474,15 +474,15 @@ typedef enum {
         } break;
             
         case PacketTypeSubscriptionAck: {
-            NSDictionary *model = packet.model;
-            NSString *channel = model[@"channel"];
-            id message = model[@"message"];
+            NSDictionary *payload = packet.payload;
+            NSString *channel = payload[@"channel"];
+            id message = payload[@"message"];
             
             [self _successfullySubscribedToChannel:channel withInitialMessage:message];
         } break;
             
         case PacketTypeUpdate: {
-            NSDictionary *model = packet.model;
+            NSDictionary *model = packet.payload;
             NSString *channel = model[@"channel"];
             id message = model[@"message"];
             
