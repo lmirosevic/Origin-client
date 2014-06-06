@@ -226,19 +226,33 @@ typedef enum {
 -(void)subscribeToChannel:(NSString *)channel block:(OriginChannelSubscriptionBlock)block {
     [self.class _validateChannel:channel];
     
-    // send the subscription packet off
-    [self _sendSubscriptionRequestForChannel:channel];
-    
-    // lazy creation of subscription blocks container set for the channel
-    if (!self.channelSubscriptionBlocks[channel]) {
-        self.channelSubscriptionBlocks[channel] = [NSMutableSet new];
+    // if we're truly subscribed to this channel, just respond immediately with our cached value
+    if ([self.subscribedChannels containsObject:channel]) {
+        if (block) {
+            id cachedRawData = self.cache[channel];
+            // process the data
+            [self _processDataForChannel:channel message:cachedRawData block:^(id object) {
+                // respond with the raw and processed data
+                if (block) block(channel, cachedRawData, object, NO);
+            }];
+        }
     }
-    
-    // store the block
-    [self.channelSubscriptionBlocks[channel] addObject:[block copy]];
-    
-    // bookkeeping
-    [self.subscribedChannelsOptimistic addObject:channel];
+    // if we've requested a subscription, but it hasn't returned yet, then just add the block to the list of handlers
+    else if ([self.subscribedChannelsOptimistic containsObject:channel]) {
+        // store the block
+        [self.class _addBlock:block forChannel:channel toLazyCollectionContainer:self.channelSubscriptionBlocks];
+    }
+    // we're not subscribed, and haven't requested subscription, so request it
+    else {
+        // send the subscription packet off
+        [self _sendSubscriptionRequestForChannel:channel];
+
+        // store the block
+        [self.class _addBlock:block forChannel:channel toLazyCollectionContainer:self.channelSubscriptionBlocks];
+        
+        // bookkeeping
+        [self.subscribedChannelsOptimistic addObject:channel];
+    }
 }
 
 -(void)unsubscribeFromChannel:(NSString *)channel {
@@ -266,13 +280,8 @@ typedef enum {
     [self.class _validateChannel:channel];
     if (!block) @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"Block must not be nil." userInfo:nil];
     
-    // lazy creation of update blocks container set for the channel
-    if (!self.channelUpdateBlocks[channel]) {
-        self.channelUpdateBlocks[channel] = [NSMutableSet new];
-    }
-    
     // store the block
-    [self.channelUpdateBlocks[channel] addObject:[block copy]];
+    [self.class _addBlock:block forChannel:channel toLazyCollectionContainer:self.channelUpdateBlocks];
 }
 
 -(void)removeUpdateHandlerForChannel:(NSString *)channel block:(OriginValueBlock)block {
@@ -339,6 +348,16 @@ typedef enum {
     if (!channel || !([channel isKindOfClass:NSString.class] && channel.length > 0)) @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"Channel must be a non-empty string." userInfo:nil];
 }
 
++(void)_addBlock:(id)block forChannel:(NSString *)channel toLazyCollectionContainer:(NSMutableDictionary *)container {
+    // lazy creation of container for channel subscription blocks
+    if (!container[channel]) {
+        container[channel] = [NSMutableOrderedSet new];
+    }
+    
+    // store the block
+    if (block) [container[channel] addObject:[block copy]];
+};
+
 -(void)_processAllSubscriptionBlocksForChannel:(NSString *)channel withMessage:(NSData *)data cancelled:(BOOL)cancelled {
     // make sure we have some blocks
     if ([self.channelSubscriptionBlocks[channel] count] > 0) {
@@ -349,6 +368,9 @@ typedef enum {
                 // now run through the handlers and pipe the data through
                 for (OriginChannelSubscriptionBlock block in self.channelSubscriptionBlocks[channel]) {
                     block(channel, data, object, cancelled);
+
+                    // remove the subscription block as it's a 1 use only block
+                    [self.channelSubscriptionBlocks removeObjectForKey:channel];
                 }
             }
         }];
@@ -422,8 +444,10 @@ typedef enum {
 }
 
 -(void)_receivedChannelUpdateForChannel:(NSString *)channel message:(id)message {
-    // cache the data
-    self.cache[channel] = message;
+    if (message) {
+        // cache the data
+        self.cache[channel] = message;
+    }
     
     // fire the update handlers
     [self _processAllUpdateBlocksForChannel:channel withMessage:message];
@@ -589,6 +613,8 @@ typedef enum {
         // Incoming messages from the server on the DEALER socket
         if (items [1].revents & ZMQ_POLLIN) {
             
+            sleep(2);//lm kill
+            
             NSData *incomingData = [self _readDataFromZMQSocket:self.dealerSocketBackground];
             
             [self performSelectorOnMainThread:@selector(_receivedDataFromServer:) withObject:incomingData waitUntilDone:NO];
@@ -713,3 +739,4 @@ typedef enum {
 //
 //
 
+//lm need 2 way heartbeating, so this guy can resend his subscriptions in case the server doesn't check in for a while
