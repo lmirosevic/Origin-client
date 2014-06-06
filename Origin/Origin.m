@@ -54,7 +54,7 @@ typedef enum {
     else if ([typeString isEqualToString:@"subscriptionAck"]) {
         type = PacketTypeSubscriptionAck;
     }
-    if ([typeString isEqualToString:@"unsubscription"]) {
+    else if ([typeString isEqualToString:@"unsubscription"]) {
         type = PacketTypeUnsubscription;
     }
     else if ([typeString isEqualToString:@"unsubscriptionAck"]) {
@@ -119,8 +119,6 @@ typedef enum {
         @"type": typeString,
         @"payload": self.payload ?: @{},// if there's no payload then make it an empty dictionary as a failsafe
     };
-    
-    dictionary = @{@"foo": @"bar"};
     
     // convert to data from dictionary with msgpack
     NSData *data = [MessagePackPacker pack:dictionary];
@@ -411,7 +409,9 @@ typedef enum {
     // make sure it's not cancelled yet
     if ([self isSubscribedToChannelOptimistically:channel]) {
         // cache the data
-        self.cache[channel] = message;
+        if (message) {
+            self.cache[channel] = message;
+        }
     
         // bookkeeping
         [self.subscribedChannels addObject:channel];
@@ -445,7 +445,6 @@ typedef enum {
 #pragma mark - Util:Networking
 
 -(void)_sendHeartbeatToServer {
-    NSLog(@"Sending heatbeat to server");
     OriginPacket *heartbeat = [[OriginPacket alloc] initWithType:PacketTypeHeartbeat payload:nil];
     
     [self _sendPacketToServer:heartbeat];
@@ -494,16 +493,13 @@ typedef enum {
 -(void)_sendPacketToServer:(OriginPacket *)packet {
     // serialize it
     NSData *serializedPacket = [packet dataRepresentation];
-    NSLog(@"%@", serializedPacket);
+
     // send it off
     [self _sendDataToInprocSocket:serializedPacket];
 }
 
 -(void)_receivedDataFromServer:(NSData *)data {
     OriginPacket *packet = [OriginPacket packetWithData:data];
-    
-    NSLog(@"got a packet from the server");
-    NSLog(@"%@", packet);//lm ill
     
     [self _processReceivedPacket:packet];
 }
@@ -553,8 +549,6 @@ typedef enum {
         if (items[0].revents & ZMQ_POLLIN) {
             int err;
             
-            NSLog(@"got sth from the PAIR socket");
-            
             // Read the message from the PAIR socket
             zmq_msg_t incomingMessage;
             err = zmq_msg_init(&incomingMessage);
@@ -596,13 +590,11 @@ typedef enum {
         if (items [1].revents & ZMQ_POLLIN) {
             
             NSData *incomingData = [self _readDataFromZMQSocket:self.dealerSocketBackground];
-            NSLog(@"+++++++got the data in, should now send it using GCD to the main thread");
             
             [self performSelectorOnMainThread:@selector(_receivedDataFromServer:) withObject:incomingData waitUntilDone:NO];
         }
     }
     
-    NSLog(@"closing BG sockets");
     // close the BG sockets
     zmq_close(self.dealerSocketBackground);
     zmq_close(self.pairSocketBackground);
