@@ -134,7 +134,6 @@ typedef enum {
 @property (copy, nonatomic) OriginDeserializerBlock                     myDefaultDeserializer;
 @property (strong, nonatomic) NSMutableDictionary                       *channelDeserializers;
 @property (strong, nonatomic) NSMutableDictionary                       *channelUpdateBlocks;
-@property (strong, nonatomic) NSMutableDictionary                       *channelSubscriptionBlocks;
 @property (strong, nonatomic) NSMutableSet                              *subscribedChannels;
 @property (strong, nonatomic) NSMutableSet                              *subscribedChannelsOptimistic;
 @property (strong, nonatomic) dispatch_queue_t                          processorQueue;
@@ -173,10 +172,9 @@ typedef enum {
     if (self = [super init]) {
         self.channelDeserializers = [NSMutableDictionary new];
         self.channelUpdateBlocks = [NSMutableDictionary new];
-        self.channelSubscriptionBlocks = [NSMutableDictionary new];
         self.subscribedChannels = [NSMutableSet new];
         self.subscribedChannelsOptimistic = [NSMutableSet new];
-        self.shouldRunProcessorBlockOnBackgroundThread = kDefaultShouldRunProcessorBlockOnBackgroundThread;
+        self.shouldRunProcessorBlocksOnBackgroundThread = kDefaultShouldRunProcessorBlockOnBackgroundThread;
         self.processorQueue = dispatch_queue_create("com.goonbee.origin.processorQueue", DISPATCH_QUEUE_CONCURRENT);
         self.cache = [NSMutableDictionary new];
     }
@@ -219,80 +217,50 @@ typedef enum {
     }
 }
 
--(void)subscribeToChannel:(NSString *)channel {
-    [self subscribeToChannel:channel block:nil];
-}
-
--(void)subscribeToChannel:(NSString *)channel block:(OriginChannelSubscriptionBlock)block {
+-(void)subscribeToChannel:(NSString *)channel withBlock:(OriginChannelUpdateBlock)block {
     [self.class _validateChannel:channel];
-    
-    // if we're truly subscribed to this channel, just respond immediately with our cached value
-    if ([self.subscribedChannels containsObject:channel]) {
-        if (block) {
-            id cachedRawData = self.cache[channel];
-            // process the data
-            [self _processDataForChannel:channel message:cachedRawData block:^(id object) {
-                // respond with the raw and processed data
-                if (block) block(channel, cachedRawData, object, NO);
-            }];
-        }
-    }
-    // if we've requested a subscription, but it hasn't returned yet, then just add the block to the list of handlers
-    else if ([self.subscribedChannelsOptimistic containsObject:channel]) {
-        // store the block
-        [self.class _addBlock:block forChannel:channel toLazyCollectionContainer:self.channelSubscriptionBlocks];
-    }
-    // we're not subscribed, and haven't requested subscription, so request it
-    else {
-        // send the subscription packet off
-        [self _sendSubscriptionRequestForChannel:channel];
 
-        // store the block
-        [self.class _addBlock:block forChannel:channel toLazyCollectionContainer:self.channelSubscriptionBlocks];
+    // add this block to the listeners for this channel
+    [self _addBlock:block forChannel:channel];
+    
+    // if we're subscribed properly, then immediately respond with a LCV
+    if ([self.subscribedChannels containsObject:channel]) {
+        [self _callUpateBlock:block onChannel:channel withUnsubscribedState:NO];
+    }
+    // if we're subscribed tentatively, then do nothing
+    else if ([self.subscribedChannelsOptimistic containsObject:channel]) {
+        //noop
+    }
+    // otherwise, we need to trigger a subscription on the server
+    else {
+        // subscribe with the server on a particular channel
+        [self _sendSubscriptionRequestForChannel:channel];
         
         // bookkeeping
         [self.subscribedChannelsOptimistic addObject:channel];
     }
 }
 
--(void)unsubscribeFromChannel:(NSString *)channel {
+-(void)unsubscribeFromChannel:(NSString *)channel withBlock:(OriginChannelUpdateBlock)block {
     [self.class _validateChannel:channel];
     
-    // send the unsubscription packet off
-    [self _sendUnsubscriptionRequestForChannel:channel];
+    // call the block one last time to let him know we're unsubscribing
+    [self _callUpateBlock:block onChannel:channel withUnsubscribedState:YES];
     
-    // process the subscription in flight blocks
-    [self _processAllSubscriptionBlocksForChannel:channel withMessage:self.cache[channel] cancelled:YES];
+    // remove the update block
+    BOOL noMoreListeners = [self _removeBlock:block forChannel:channel];
     
-    // immediately remove all subscription and update blocks
-    [self.channelSubscriptionBlocks removeObjectForKey:channel];
-    [self.channelUpdateBlocks removeObjectForKey:channel];
-    
-    // bookkeeping
-    [self.subscribedChannelsOptimistic removeObject:channel];// this has the dual purpose of setting up a kind of synchronization barrier, update and subscription callbacks will check this value to make sure the channel is still subscribed to
-    [self.subscribedChannels removeObject:channel];
-    
-    // clear the cache
-    [self.cache removeObjectForKey:channel];
+    // if this was the last listener, we need to clean up
+    if (noMoreListeners) {
+        [self _cleanUpForChannel:channel];
+    }
 }
 
--(void)addUpdateHandlerForChannel:(NSString *)channel block:(OriginValueBlock)block {
-    [self.class _validateChannel:channel];
-    if (!block) @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"Block must not be nil." userInfo:nil];
-    
-    // store the block
-    [self.class _addBlock:block forChannel:channel toLazyCollectionContainer:self.channelUpdateBlocks];
+-(void)unsubscribeAllBlocksFromChannel:(NSString *)channel {
+    [self _cleanUpForChannel:channel];
 }
 
--(void)removeUpdateHandlerForChannel:(NSString *)channel block:(OriginValueBlock)block {
-    [self.channelUpdateBlocks[channel] removeObject:block];
-}
-
--(void)removeAllUpdateHandlerForChannel:(NSString *)channel {
-    [self.channelUpdateBlocks[channel] removeAllObjects];
-}
-
--(void)currentValueForChannel:(NSString *)channel block:(OriginValueBlock)block {
+-(void)currentValueForChannel:(NSString *)channel block:(OriginChannelUpdateBlock)block {
     [self.class _validateChannel:channel];
     if (!block) @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"Block must not be nil." userInfo:nil];
     
@@ -301,7 +269,7 @@ typedef enum {
     // process it
     [self _processDataForChannel:channel message:data block:^(id object) {
         // pass it back to the caller
-        block(channel, data, object);
+        block(channel, data, object, NO);
     }];
 }
 
@@ -348,45 +316,61 @@ typedef enum {
     if (!channel || !([channel isKindOfClass:NSString.class] && channel.length > 0)) @throw [NSException exceptionWithName:NSInvalidArgumentException reason:@"Channel must be a non-empty string." userInfo:nil];
 }
 
-+(void)_addBlock:(id)block forChannel:(NSString *)channel toLazyCollectionContainer:(NSMutableDictionary *)container {
+-(void)_addBlock:(id)block forChannel:(NSString *)channel {
     // lazy creation of container for channel subscription blocks
-    if (!container[channel]) {
-        container[channel] = [NSMutableOrderedSet new];
+    if (!self.channelUpdateBlocks[channel]) {
+        self.channelUpdateBlocks[channel] = [NSMutableOrderedSet new];
     }
     
     // store the block
-    if (block) [container[channel] addObject:[block copy]];
+    if (block) [self.channelUpdateBlocks[channel] addObject:[block copy]];
 };
 
--(void)_processAllSubscriptionBlocksForChannel:(NSString *)channel withMessage:(NSData *)data cancelled:(BOOL)cancelled {
-    // make sure we have some blocks
-    if ([self.channelSubscriptionBlocks[channel] count] > 0) {
-        // process the data first
-        [self _processDataForChannel:channel message:data block:^(id object) {
-            // make sure we're still subscribed (or we're in the process of cancelling)
-            if ([self isSubscribedToChannelOptimistically:channel] || cancelled) {
-                // now run through the handlers and pipe the data through
-                for (OriginChannelSubscriptionBlock block in self.channelSubscriptionBlocks[channel]) {
-                    block(channel, data, object, cancelled);
+-(BOOL)_removeBlock:(id)block forChannel:(NSString *)channel {
+    if (block) [self.channelUpdateBlocks[channel] removeObject:block];
+    
+    return ([self.channelUpdateBlocks[channel] count] == 0);//lm returns YES if this was the last block
+}
 
-                    // remove the subscription block as it's a 1 use only block
-                    [self.channelSubscriptionBlocks removeObjectForKey:channel];
-                }
-            }
+-(void)_removeAllBlocksForChannel:(NSString *)channel {
+    // this removes the set inside, which removes all blocks. it's ok since it's lazy in there
+    [self.channelUpdateBlocks removeObjectForKey:channel];
+}
+
+-(void)_callUpateBlock:(OriginChannelUpdateBlock)block onChannel:(NSString *)channel withUnsubscribedState:(BOOL)unsubscribed {
+    if (block) {
+        id cachedValue = self.cache[channel];
+        [self _processDataForChannel:channel message:cachedValue block:^(id object) {
+            block(channel, cachedValue, object, unsubscribed);
         }];
     }
 }
 
--(void)_processAllUpdateBlocksForChannel:(NSString *)channel withMessage:(id)message {
+-(void)_cleanUpForChannel:(NSString *)channel {
+    // bookkeeping
+    [self.subscribedChannelsOptimistic removeObject:channel];// this has the dual purpose of setting up a kind of synchronization barrier, as update callbacks will check this value to make sure the channel is still subscribed to before firing
+    [self.subscribedChannels removeObject:channel];
+    
+    // notify our listeners
+    [self _processAllUpdateBlocksForChannel:channel withMessage:self.cache[channel] unsubscribed:YES];
+    
+    // clear the cache
+    [self.cache removeObjectForKey:channel];
+    
+    // tell the server we are no longer intersted
+    [self _sendUnsubscriptionRequestForChannel:channel];
+}
+
+-(void)_processAllUpdateBlocksForChannel:(NSString *)channel withMessage:(id)message unsubscribed:(BOOL)unsubscribed {
     // make sure we have some blocks
     if ([self.channelUpdateBlocks[channel] count] > 0) {
         // process the data first
         [self _processDataForChannel:channel message:message block:^(id object) {
-            // make sure we're still subscribed
-            if ([self isSubscribedToChannelOptimistically:channel]) {
+            // make sure we're still subscribed, or we're unsubscribing now
+            if ([self isSubscribedToChannelOptimistically:channel] || unsubscribed) {
                 // now run through the handlers and pipe the message through
-                for (OriginValueBlock block in self.channelUpdateBlocks[channel]) {
-                    block(channel, message, object);
+                for (OriginChannelUpdateBlock block in self.channelUpdateBlocks[channel]) {
+                    block(channel, message, object, unsubscribed);
                 }
             }
         }];
@@ -409,7 +393,7 @@ typedef enum {
     }
     else {
         // run it on the FG thread
-        if (!self.shouldRunProcessorBlockOnBackgroundThread) {
+        if (!self.shouldRunProcessorBlocksOnBackgroundThread) {
             block(processor(message));
         }
         // run it on the BG thread
@@ -439,7 +423,7 @@ typedef enum {
         [self.subscribedChannels addObject:channel];
         
         // fire the subscription handlers
-        [self _processAllSubscriptionBlocksForChannel:channel withMessage:message cancelled:NO];
+        [self _processAllUpdateBlocksForChannel:channel withMessage:message unsubscribed:NO];
     }
 }
 
@@ -450,7 +434,7 @@ typedef enum {
     }
     
     // fire the update handlers
-    [self _processAllUpdateBlocksForChannel:channel withMessage:message];
+    [self _processAllUpdateBlocksForChannel:channel withMessage:message unsubscribed:NO];
 }
 
 -(void)_startHeartbeatTimer {
@@ -612,9 +596,6 @@ typedef enum {
         
         // Incoming messages from the server on the DEALER socket
         if (items [1].revents & ZMQ_POLLIN) {
-            
-            sleep(2);//lm kill
-            
             NSData *incomingData = [self _readDataFromZMQSocket:self.dealerSocketBackground];
             
             [self performSelectorOnMainThread:@selector(_receivedDataFromServer:) withObject:incomingData waitUntilDone:NO];

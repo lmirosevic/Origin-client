@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name                  = 'Origin'
-  s.version               = '0.1.1'
+  s.version               = '1.0.0'
   s.summary               = 'Objective-C client library for Goonbee\'s chat service, for iOS and OS X.'
   s.homepage              = 'https://github.com/lmirosevic/Origin-client'
   s.license               = { type: 'Apache License, Version 2.0', file: 'LICENSE' }
