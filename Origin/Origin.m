@@ -16,6 +16,7 @@
 
 static BOOL const kDefaultShouldRunProcessorBlockOnBackgroundThread =   NO;
 static NSTimeInterval const kHeartbeatInterval =                        5;// seconds
+static NSTimeInterval const kReconnectionInterval =                     3;// seconds
 
 static NSString * const kInprocEndpointName =                           @"internalProxy";// used for sending messages between threads
 
@@ -152,6 +153,8 @@ typedef enum {
 @property (assign, nonatomic) void                                      *pairSocketMain;
 @property (assign, nonatomic) void                                      *pairSocketBackground;
 
+@property (assign, nonatomic) BOOL                                      dealerConnected;
+@property (assign, nonatomic) BOOL                                      pairBound;
 
 @end
 
@@ -520,27 +523,36 @@ typedef enum {
 
 -(void)_setupBackgroundMachine {
     @autoreleasepool {
-        // Setup
-        [self _connectDealerSocketToServer:self.server port:self.port];
-        [self _bindPairSocketToInprocEndpoint:kInprocEndpointName];
-
-        // Start our loop
-        [self _startMessageListenerLoop];
+        while (YES) {
+            // Setup
+            if (!self.dealerConnected) self.dealerConnected = [self _connectDealerSocketToServer:self.server port:self.port];
+            if (!self.pairBound) self.pairBound = [self _bindPairSocketToInprocEndpoint:kInprocEndpointName];
+            
+            //make sure they're both up, otherwise loop, with a while and sleep
+            if (self.dealerConnected && self.pairBound) {
+                [self _startMessageListenerLoop];
+            }
+            else {
+                usleep(kReconnectionInterval * 1000000);
+                continue;
+            }
+        }
     }
 }
 
--(void)_connectDealerSocketToServer:(NSString *)server port:(NSUInteger)port {
+-(BOOL)_connectDealerSocketToServer:(NSString *)server port:(NSUInteger)port {
     // Connect the DEALER socket to the server
     self.dealerSocketBackground = zmq_socket(self.context, ZMQ_DEALER);
-    int rc = zmq_connect(self.dealerSocketBackground, [[NSString stringWithFormat:@"tcp://%@:%ld", server, port] UTF8String]);
-    assert(rc == 0);
+    const char *endpoint = [[NSString stringWithFormat:@"tcp://%@:%ld", server, (unsigned long)port] UTF8String];
+    int rc = zmq_connect(self.dealerSocketBackground, endpoint);
+    return (rc == 0);
 }
 
--(void)_bindPairSocketToInprocEndpoint:(NSString *)inprocEndpoint {
+-(BOOL)_bindPairSocketToInprocEndpoint:(NSString *)inprocEndpoint {
     // Bind the inproc PAIR socket on the known endpoint, so we can message it from other threads
     self.pairSocketBackground = zmq_socket(self.context, ZMQ_PAIR);
     int rc = zmq_bind(self.pairSocketBackground, [[NSString stringWithFormat:@"inproc://%@", inprocEndpoint] UTF8String]);
-    assert(rc == 0);
+    return (rc == 0);
 }
 
 -(void)_startMessageListenerLoop {
