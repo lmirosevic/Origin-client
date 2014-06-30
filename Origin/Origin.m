@@ -12,10 +12,10 @@
 #import "zmq.h"
 
 static BOOL const kDefaultShouldRunProcessorBlockOnBackgroundThread =   NO;
-static NSTimeInterval const kHeartbeatEmissionInterval =                10;// seconds. The period when heartbeats are emitted.
-static NSTimeInterval const kServerHeartbeatMonitorInterval =           1;// seconds. The time period when a TTL exceedance is checked.
-static NSTimeInterval const kServerHeartbeatTTL =                       30;// seconds. The period of silence after which we consider the server dead.
-static NSTimeInterval const kReconnectionInterval =                     3;// seconds. Time to wait before retrying the initial server connection again.
+static NSTimeInterval const kHeartbeatEmissionInterval =                10;     // seconds. The period when heartbeats are emitted.
+static NSTimeInterval const kServerHeartbeatMonitorInterval =           1;      // seconds. The time period when a TTL exceedance is checked.
+static NSTimeInterval const kServerHeartbeatTTL =                       30;     // seconds. The period of silence after which we consider the server dead.
+static NSTimeInterval const kReconnectionInterval =                     3;      // seconds. Time to wait before retrying the initial server connection again.
 
 static NSString * const kInprocEndpointName =                           @"internalProxy";// used for sending messages between threads
 
