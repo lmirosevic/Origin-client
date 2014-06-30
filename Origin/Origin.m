@@ -6,17 +6,16 @@
 //  Copyright (c) 2014 Goonbee. All rights reserved.
 //
 
-//lm in case of server reconnection, we should resend all sub commands just to be safe, because the server might have lost all of it's currently active connects. we should listen on the zmq socket, and resend the sub command in the case of reconnect
-//(lm automatic reconnection, should be handled automatically by zmq)
-
 #import "Origin.h"
 
 #import <MessagePack/MessagePack.h>
 #import "zmq.h"
 
 static BOOL const kDefaultShouldRunProcessorBlockOnBackgroundThread =   NO;
-static NSTimeInterval const kHeartbeatInterval =                        5;// seconds
-static NSTimeInterval const kReconnectionInterval =                     3;// seconds
+static NSTimeInterval const kHeartbeatEmissionInterval =                10;// seconds. The period when heartbeats are emitted.
+static NSTimeInterval const kServerHeartbeatMonitorInterval =           1;// seconds. The time period when a TTL exceedance is checked.
+static NSTimeInterval const kServerHeartbeatTTL =                       30;// seconds. The period of silence after which we consider the server dead.
+static NSTimeInterval const kReconnectionInterval =                     3;// seconds. Time to wait before retrying the initial server connection again.
 
 static NSString * const kInprocEndpointName =                           @"internalProxy";// used for sending messages between threads
 
@@ -139,7 +138,13 @@ typedef enum {
 @property (strong, nonatomic) NSMutableSet                              *subscribedChannelsOptimistic;
 @property (strong, nonatomic) dispatch_queue_t                          processorQueue;
 @property (strong, nonatomic) NSMutableDictionary                       *cache;
-@property (strong, nonatomic) NSTimer                                   *heartbeatTimer;
+
+@property (strong, nonatomic) NSTimer                                   *clientHeartbeatEmitterTimer;
+
+@property (strong, nonatomic) NSTimer                                   *serverHeartbeatMonitorTimer;
+@property (strong, nonatomic) NSDate                                    *dateLastServerHeartbeatReceived;
+
+@property (assign, nonatomic) BOOL                                      canSendPlumbingPacket;
 
 @property (assign, nonatomic, readwrite) BOOL                           isConnected;
 
@@ -186,7 +191,8 @@ typedef enum {
 }
 
 -(void)dealloc {
-    [self _stopHeartbeatTimer];
+    [self _stopClientHeartbeatEmitterTimer];
+    [self _stopServerHeartbeatMonitorTimer];
     [self _disconnectFromServer];
 }
 
@@ -213,7 +219,8 @@ typedef enum {
         [self.backgroundThread start];
         
         // start the heartbeat stuff
-        [self _startHeartbeatTimer];
+        [self _startClientHeartbeatEmitterTimer];
+        [self _startServerHeartbeatMonitorTimer];
     }
     else {
         NSLog(@"Origin is already connected. Skipping operation...");
@@ -332,7 +339,7 @@ typedef enum {
 -(BOOL)_removeBlock:(id)block forChannel:(NSString *)channel {
     if (block) [self.channelUpdateBlocks[channel] removeObject:block];
     
-    return ([self.channelUpdateBlocks[channel] count] == 0);//lm returns YES if this was the last block
+    return ([self.channelUpdateBlocks[channel] count] == 0);// returns YES if this was the last block
 }
 
 -(void)_removeAllBlocksForChannel:(NSString *)channel {
@@ -440,25 +447,86 @@ typedef enum {
     [self _processAllUpdateBlocksForChannel:channel withMessage:message unsubscribed:NO];
 }
 
--(void)_startHeartbeatTimer {
+-(void)_startClientHeartbeatEmitterTimer {
     // clear any potential old one
-    [self _stopHeartbeatTimer];
+    [self _stopClientHeartbeatEmitterTimer];
     
     // create and schedule a new one
-    self.heartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:kHeartbeatInterval target:self selector:@selector(_sendHeartbeatToServer) userInfo:nil repeats:YES];
+    self.clientHeartbeatEmitterTimer = [NSTimer scheduledTimerWithTimeInterval:kHeartbeatEmissionInterval target:self selector:@selector(_sendHeartbeatToServer) userInfo:nil repeats:YES];
 }
 
--(void)_stopHeartbeatTimer {
-    [self.heartbeatTimer invalidate];
-    self.heartbeatTimer = nil;
+-(void)_stopClientHeartbeatEmitterTimer {
+    [self.clientHeartbeatEmitterTimer invalidate];
+    self.clientHeartbeatEmitterTimer = nil;
+}
+
+-(void)_startServerHeartbeatMonitorTimer {
+    // stop the old one if we had one
+    [self _stopServerHeartbeatMonitorTimer];
+    
+    // set the current time
+    [self _resetServerHeartbeatTTL];
+    
+    // create and schedule a new one
+    self.serverHeartbeatMonitorTimer = [NSTimer scheduledTimerWithTimeInterval:kServerHeartbeatMonitorInterval target:self selector:@selector(_checkHeartbeatFromServer) userInfo:nil repeats:YES];
+}
+
+-(void)_stopServerHeartbeatMonitorTimer {
+    [self.serverHeartbeatMonitorTimer invalidate];
+    self.serverHeartbeatMonitorTimer = nil;
+}
+
+-(void)_resetServerHeartbeatTTL {
+    self.dateLastServerHeartbeatReceived = [NSDate date];
+}
+
+-(void)_lockPlumbingSending {
+    self.canSendPlumbingPacket = NO;
+}
+
+-(void)_unlockPlumbingSending {
+    self.canSendPlumbingPacket = YES;
+}
+
+-(BOOL)_isPlumbingSendingUnlocked {
+    return self.canSendPlumbingPacket;
 }
 
 #pragma mark - Util:Networking
 
 -(void)_sendHeartbeatToServer {
-    OriginPacket *heartbeat = [[OriginPacket alloc] initWithType:PacketTypeHeartbeat payload:nil];
+    if ([self _isPlumbingSendingUnlocked]) {
+        OriginPacket *heartbeat = [[OriginPacket alloc] initWithType:PacketTypeHeartbeat payload:nil];
+        
+        [self _sendPacketToServer:heartbeat];
+    }
+}
+
+-(void)_checkHeartbeatFromServer {
+    // get current date
+    NSDate *currentDate = [NSDate date];
+
+    // see when we got the last heartbeat
+    NSTimeInterval timeElapsedSinceLastHeartbeat = [currentDate timeIntervalSinceDate:self.dateLastServerHeartbeatReceived];
     
-    [self _sendPacketToServer:heartbeat];
+    // check to see if we haven't heard from the server in a while and consider it dead, but make sure we only send a single resub per death
+    if (timeElapsedSinceLastHeartbeat > kServerHeartbeatTTL && [self _isPlumbingSendingUnlocked]) {
+        // if so trigger a resub on all channels
+        [self _resubscribeOnAllChannels];
+        
+        // and reset the server heartbeat TTL
+        [self _resetServerHeartbeatTTL];
+        
+        // lock the resubscriptions so we don't send them again until we're resurrected
+        [self _lockPlumbingSending];
+    }
+}
+
+-(void)_resubscribeOnAllChannels {
+    // send a subscription request to all channels which the user has the intention of being subscribed to
+    for (NSString *channel in self.subscribedChannelsOptimistic) {
+        [self _sendSubscriptionRequestForChannel:channel];
+    }
 }
 
 -(void)_sendSubscriptionRequestForChannel:(NSString *)channel {
@@ -474,6 +542,13 @@ typedef enum {
 }
 
 -(void)_processReceivedPacket:(OriginPacket *)packet {
+    // we treat all packets as heartbeats
+    [self _resetServerHeartbeatTTL];
+    
+    // the server is now considered alive, so in case of death we can now send a resub
+    [self _unlockPlumbingSending];
+    
+    // process the packet
     switch (packet.type) {
         case PacketTypeSubscription:
         case PacketTypeUnsubscription:
@@ -528,9 +603,12 @@ typedef enum {
             if (!self.dealerConnected) self.dealerConnected = [self _connectDealerSocketToServer:self.server port:self.port];
             if (!self.pairBound) self.pairBound = [self _bindPairSocketToInprocEndpoint:kInprocEndpointName];
             
-            //make sure they're both up, otherwise loop, with a while and sleep
+            // make sure they're both up, otherwise loop, with a while and sleep
             if (self.dealerConnected && self.pairBound) {
                 [self _startMessageListenerLoop];
+                
+                // we got our first aliveness, so unlock resub sending
+                [self _unlockPlumbingSending];
             }
             else {
                 usleep(kReconnectionInterval * 1000000);
@@ -592,7 +670,6 @@ typedef enum {
                 }
             }
 
-            
             // Send the raw message on the DEALER socket
             err = zmq_sendmsg(self.dealerSocketBackground, &incomingMessage, 0);
             if (err == -1) {
@@ -683,7 +760,7 @@ typedef enum {
     // Close the main socket
     zmq_close(self.pairSocketMain);
 
-    // Destroy the context, which will trigger ETERM on the background thread triggering it clean up
+    // Destroy the context, which will trigger ETERM on the background thread triggering it to clean up
     zmq_ctx_destroy(self.context);
 }
 
@@ -731,5 +808,3 @@ typedef enum {
 //    Heartbeat: String
 //
 //
-
-//lm need 2 way heartbeating, so this guy can resend his subscriptions in case the server doesn't check in for a while
