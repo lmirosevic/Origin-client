@@ -4,14 +4,14 @@ Origin: A simple & scalable pub/sub service with Last Value Caching, written in 
 
 This is the Objective-C client library, used for connecting to the Origin service, so you can subscribe on channels and consume updates in your iOS & Mac OS X apps.
 
-[Node.js Service Interface](https://github.com/lmirosevic/Origin-service-interface)  
+[Node.js Service Interface](https://github.com/lmirosevic/Origin-interface)  
 [Node.js Service](https://github.com/lmirosevic/Origin-service)  
 [Objective-C Client](https://github.com/lmirosevic/Origin-client)
 
 Copyright & License
 ------------
 
-Copyright 2014 Luka Mirosevic
+Copyright 2015 Luka Mirosevic
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may not use this work except in compliance with the License. You may obtain a copy of the License in the LICENSE file, or at:
 
